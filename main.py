@@ -3,11 +3,19 @@ from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional, Tuple
 from app.router import SafePathRouter
+from pathlib import Path
 
 app = FastAPI()
 
+csv_file_name = "NYPD.csv"
+
+current_file_dir = Path(__file__).parent
+
+crime_data_path = current_file_dir / "app" / csv_file_name
+
 # Load your crime data once at startup
-router = SafePathRouter(crime_data_path="app/NYPD.csv")
+router = SafePathRouter(crime_data_path=crime_data_path)
+#router = SafePathRouter(crime_data_path="app/NYPD.csv")
 
 class CoordinateTuple(BaseModel):
     latitude: float

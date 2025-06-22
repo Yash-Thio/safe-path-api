@@ -5,14 +5,24 @@ import requests
 from geopy.distance import geodesic
 from sklearn.mixture import GaussianMixture
 from datetime import datetime
+from pathlib import Path
+from sklearn.neighbors import BallTree, KDTree
 
+
+MIN_WAYPOINT_DISTANCE_KM = 0.5
 
 class SafePathRouter:
-    def __init__(self, crime_data_path):
+    def __init__(self, crime_data_path: Path):
         try:
-            self.crime_data = pd.read_csv(crime_data_path)
+            self.crime_data = pd.read_csv(str(crime_data_path))
             self.crime_data = self.crime_data.dropna(subset=['Latitude', 'Longitude'])
 
+            self.crime_coords = self.crime_data[['Latitude', 'Longitude']].values
+
+            self.crime_tree = BallTree(np.radians(self.crime_coords), leaf_size=15)
+            print(f"Built BallTree for {len(self.crime_coords)} crime records.", file=sys.stderr)
+            self.crime_centers, _ = self.analyze_crime_clusters()
+            print(f"Analyzed {len(self.crime_centers)} crime clusters during startup.", file=sys.stderr)
             if 'CMPLNT_FR_TM' in self.crime_data.columns:
                 self.crime_data['hour'] = self.crime_data['CMPLNT_FR_TM'].apply(
                     lambda x: int(str(x).split(':')[0]) if isinstance(x, str) and ':' in str(x) else 12
@@ -122,21 +132,29 @@ class SafePathRouter:
         try:
             distances = [geodesic(location, center).kilometers for center in crime_centers]
 
+            min_crime_distance = 10.0 # Default if no relevant crimes found
+            time_safety_factor = 0.8 # Default if time data not used
             if time_weight and current_hour is not None and self.hourly_crime_prob is not None:
-                relevant_crimes = self.crime_data[
+                relevant_crimes_df = self.crime_data[
                     (self.crime_data['hour'] >= (current_hour - 2) % 24) &
                     (self.crime_data['hour'] <= (current_hour + 2) % 24)
                 ]
 
-                if len(relevant_crimes) > 0:
-                    relevant_coords = relevant_crimes[['Latitude', 'Longitude']].values
-                    min_crime_distance = min([
-                        geodesic(location, (lat, lon)).kilometers
-                        for lat, lon in relevant_coords
-                    ]) if len(relevant_coords) > 0 else 10.0
-                    time_safety_factor = min(1.0, min_crime_distance / 2.0)
+                if len(relevant_crimes_df) > 0:
+                    relevant_crime_coords = relevant_crimes_df[['Latitude', 'Longitude']].values
+                    relevant_crime_tree = BallTree(np.radians(relevant_crime_coords), leaf_size=15)
+                    dist, _ = relevant_crime_tree.query(np.radians([location]), k=1)
+                    min_crime_distance = dist[0][0] * 6371.0
+                    #time_safety_factor = min(1.0, min_crime_distance / 2.0)
+                    # min_crime_distance = min([
+                    #     geodesic(location, (lat, lon)).kilometers
+                    #     for lat, lon in relevant_coords
+                    # ]) if len(relevant_coords) > 0 else 10.0
+                    # time_safety_factor = min(1.0, min_crime_distance / 2.0)
                 else:
                     time_safety_factor = 1.0
+
+                time_safety_factor = min(1.0, min_crime_distance / 2.0)
             else:
                 time_safety_factor = 0.8
 
@@ -146,9 +164,76 @@ class SafePathRouter:
             return min(10.0, safety_score)
         except Exception as e:
             print(f"Error calculating safety score: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             return 5.0
 
     def generate_safe_route(self, start, end, current_time=None):
+        # try:
+        #     if current_time is None:
+        #         current_time = datetime.now()
+        #     current_hour = current_time.hour
+        #     time_weight = self._calculate_time_weight(current_hour)
+        #     print(f"Generating route for time: {current_hour}:00, time weights calculated", file=sys.stderr)
+
+        #     crime_centers, _ = self.analyze_crime_clusters()
+
+        #     mid_lat = (start[0] + end[0]) / 2
+        #     mid_lng = (start[1] + end[1]) / 2
+        #     direct_distance = geodesic(start, end).kilometers
+        #     search_radius = max(1000, int(direct_distance * 1000))
+        #     midpoint = (mid_lat, mid_lng)
+        #     safe_locations = self.find_safe_locations(midpoint, radius=search_radius)
+
+        #     # # --- TEMPORARY SHORT-TERM FIX STARTS HERE ---
+        #     # original_safe_locations_count = len(safe_locations)
+        #     # safe_locations = safe_locations[:50] # Limit to 50 locations for testing
+        #     # print(f"DEBUG: Limited safe_locations from {original_safe_locations_count} to {len(safe_locations)} for testing.", file=sys.stderr)
+        #     # # --- TEMPORARY SHORT-TERM FIX ENDS HERE ---
+        #     start_safety = self.calculate_safety_score(start, crime_centers, time_weight, current_hour)
+        #     end_safety = self.calculate_safety_score(end, crime_centers, time_weight, current_hour)
+
+            
+        #     waypoints = []
+        #     for loc in safe_locations:
+        #         loc_coords = (loc['coordinates']['latitude'], loc['coordinates']['longitude'])
+        #         crime_safety_score = self.calculate_safety_score(
+        #             loc_coords, crime_centers, time_weight, current_hour
+        #         )
+        #         combined_safety = (crime_safety_score * 0.7) + (loc['safety_type_rating'] * 0.3)
+        #         direct_path_dist = self._point_to_line_distance(loc_coords, start, end)
+        #         path_penalty = min(1.0, direct_path_dist / (direct_distance * 0.5))
+        #         waypoint_score = combined_safety * (1 - path_penalty)
+        #         waypoints.append({
+        #             'id': loc['id'],
+        #             'name': loc['name'],
+        #             'coordinates': loc['coordinates'],
+        #             'safety_score': float(combined_safety),
+        #             'address': loc['address'],
+        #             'categories': loc['categories'],
+        #             'is_24h': loc['is_24h'],
+        #             'waypoint_score': float(waypoint_score)
+        #         })
+
+        #     waypoints.sort(key=lambda x: x['waypoint_score'], reverse=True)
+        #     top_waypoints = waypoints[:15]
+
+        #     return {
+        #         'start': {
+        #             'coordinates': {'latitude': start[0], 'longitude': start[1]},
+        #             'safety_score': float(start_safety)
+        #         },
+        #         'end': {
+        #             'coordinates': {'latitude': end[0], 'longitude': end[1]},
+        #             'safety_score': float(end_safety)
+        #         },
+        #         'waypoints': top_waypoints,
+        #         'overall_safety_score': float(np.mean([start_safety, end_safety] + [w['safety_score'] for w in top_waypoints]))
+        #     }
+
+        # except Exception as e:
+        #     print(f"Error generating safe route: {e}", file=sys.stderr)
+        #     return {'error': str(e), 'message': 'Failed to generate safe route'}
         try:
             if current_time is None:
                 current_time = datetime.now()
@@ -156,20 +241,57 @@ class SafePathRouter:
             time_weight = self._calculate_time_weight(current_hour)
             print(f"Generating route for time: {current_hour}:00, time weights calculated", file=sys.stderr)
 
-            crime_centers, _ = self.analyze_crime_clusters()
+            #  For performance, crime_centers should be calculated ONCE in __init__
+           
+            crime_centers = self.crime_centers
+            print(f"Crime clusters analyzed: {len(crime_centers)} centers", file=sys.stderr)
 
             mid_lat = (start[0] + end[0]) / 2
             mid_lng = (start[1] + end[1]) / 2
             direct_distance = geodesic(start, end).kilometers
+            # The search_radius can still be large to capture a wide area for initial candidates
             search_radius = max(1000, int(direct_distance * 1000))
             midpoint = (mid_lat, mid_lng)
-            safe_locations = self.find_safe_locations(midpoint, radius=search_radius)
+            safe_locations_raw = self.find_safe_locations(midpoint, radius=search_radius)
+            print(f"Found {len(safe_locations_raw)} raw potential safe locations from Overpass.", file=sys.stderr)
+
+            # --- NEW: Filter/Sample safe_locations to a more manageable number ---
+            
+            safe_locations_raw.sort(key=lambda x: x.get('safety_type_rating', 0), reverse=True)
+
+            selected_safe_locations = []
+            selected_coords = [] 
+
+            MAX_FINAL_WAYPOINTS_TO_SCORE = 200 # A reasonable upper limit to score, adjust as needed
+
+            for loc in safe_locations_raw:
+                loc_coords = (loc['coordinates']['latitude'], loc['coordinates']['longitude'])
+                is_too_close = False
+                for sel_lat, sel_lon in selected_coords:
+                    if geodesic(loc_coords, (sel_lat, sel_lon)).kilometers < MIN_WAYPOINT_DISTANCE_KM:
+                        is_too_close = True
+                        break
+                if not is_too_close:
+                    selected_safe_locations.append(loc)
+                    selected_coords.append(loc_coords)
+                    if len(selected_safe_locations) >= MAX_FINAL_WAYPOINTS_TO_SCORE:
+                        break 
+
+            safe_locations = selected_safe_locations
+            print(f"Reduced potential safe locations to {len(safe_locations)} after spatial filtering.", file=sys.stderr)
+            # --- END NEW FILTERING ---
 
             start_safety = self.calculate_safety_score(start, crime_centers, time_weight, current_hour)
+            print(f"Calculated start safety: {start_safety}", file=sys.stderr)
             end_safety = self.calculate_safety_score(end, crime_centers, time_weight, current_hour)
+            print(f"Calculated end safety: {end_safety}", file=sys.stderr)
 
             waypoints = []
-            for loc in safe_locations:
+            
+            for i, loc in enumerate(safe_locations):
+                if i % 20 == 0: 
+                    print(f"Processing final waypoint candidate {i+1}/{len(safe_locations)}", file=sys.stderr)
+
                 loc_coords = (loc['coordinates']['latitude'], loc['coordinates']['longitude'])
                 crime_safety_score = self.calculate_safety_score(
                     loc_coords, crime_centers, time_weight, current_hour
@@ -189,8 +311,10 @@ class SafePathRouter:
                     'waypoint_score': float(waypoint_score)
                 })
 
+            print(f"Finished processing all {len(waypoints)} waypoints.", file=sys.stderr)
             waypoints.sort(key=lambda x: x['waypoint_score'], reverse=True)
             top_waypoints = waypoints[:15]
+            print(f"Selected top {len(top_waypoints)} best waypoints.", file=sys.stderr)
 
             return {
                 'start': {
@@ -207,6 +331,8 @@ class SafePathRouter:
 
         except Exception as e:
             print(f"Error generating safe route: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             return {'error': str(e), 'message': 'Failed to generate safe route'}
 
     def _point_to_line_distance(self, point, line_start, line_end):
